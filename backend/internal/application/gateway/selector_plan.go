@@ -74,17 +74,19 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 	if left.Priority != right.Priority {
 		return left.Priority > right.Priority
 	}
-	if leftScore.billingFresh != rightScore.billingFresh {
-		return leftScore.billingFresh
-	}
 	if leftScore.inFlight != rightScore.inFlight {
 		return leftScore.inFlight < rightScore.inFlight
 	}
-	if leftScore.remaining != rightScore.remaining {
-		return leftScore.remaining > rightScore.remaining
-	}
+	// 同一能力、等级和优先级内先保证请求公平轮转；额度快照只用于
+	// 首次选择或完全同分时决策，不能让单个账号长期独占流量。
 	if !leftScore.lastSelected.Equal(rightScore.lastSelected) {
 		return leftScore.lastSelected.Before(rightScore.lastSelected)
+	}
+	if leftScore.billingFresh != rightScore.billingFresh {
+		return leftScore.billingFresh
+	}
+	if leftScore.remaining != rightScore.remaining {
+		return leftScore.remaining > rightScore.remaining
 	}
 	return left.ID < right.ID
 }

@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -401,6 +402,101 @@ func TestSelectorUsesBatchConcurrencySnapshot(t *testing.T) {
 	first, ok := plan.Next()
 	if limiter.batchCalls != 1 || limiter.currentCalls != 0 || !ok || first.Credential.ID != 2 {
 		t.Fatalf("batchCalls=%d currentCalls=%d values=%#v", limiter.batchCalls, limiter.currentCalls, values)
+	}
+}
+
+func TestSelectorRotatesEquivalentAccountsAndAfterStickyExpiry(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "round-robin.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	accounts := relational.NewAccountRepository(database)
+	now := time.Now().UTC()
+	for index := range 3 {
+		credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderBuild, Name: fmt.Sprintf("account-%d", index+1), SourceKey: fmt.Sprintf("account-%d", index+1),
+			EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 1, MaxConcurrent: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		billing := account.Billing{AccountID: credential.ID, MonthlyLimit: float64(100 - index*10), SyncedAt: now.Add(-time.Duration(index) * time.Hour)}
+		if err := accounts.SaveBilling(ctx, billing); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	selected := make([]uint64, 0, 3)
+	for range 3 {
+		lease, err := selector.Acquire(ctx, account.ProviderBuild, "grok-4.5", "", "", nil, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		selected = append(selected, lease.Credential.ID)
+		lease.Release()
+	}
+	if unique := map[uint64]struct{}{selected[0]: {}, selected[1]: {}, selected[2]: {}}; len(unique) != 3 {
+		t.Fatalf("non-sticky selections = %v, want each equivalent account once", selected)
+	}
+
+	selector.UpdateConfig(10*time.Millisecond, time.Second, time.Minute)
+	stickyFirst, err := selector.Acquire(ctx, account.ProviderBuild, "grok-4.5", "", "short-session", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stickyID := stickyFirst.Credential.ID
+	stickyFirst.Release()
+	stickyHit, err := selector.Acquire(ctx, account.ProviderBuild, "grok-4.5", "", "short-session", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stickyHit.Credential.ID != stickyID {
+		t.Fatalf("active sticky session moved from %d to %d", stickyID, stickyHit.Credential.ID)
+	}
+	stickyHit.Release()
+	time.Sleep(20 * time.Millisecond)
+	afterExpiry, err := selector.Acquire(ctx, account.ProviderBuild, "grok-4.5", "", "short-session", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer afterExpiry.Release()
+	if afterExpiry.Credential.ID == stickyID {
+		t.Fatalf("expired sticky session stayed on account %d, want least recently selected account", stickyID)
+	}
+}
+
+func TestCandidatePlanLeastRecentlySelectedPrecedesBillingPreference(t *testing.T) {
+	now := time.Now().UTC()
+	selector := &Selector{
+		concurrency:    memory.NewConcurrencyLimiter(),
+		lastSelectedAt: map[uint64]time.Time{1: now},
+	}
+	values := []account.RoutingCandidate{
+		{
+			Credential:           account.Credential{ID: 1, Priority: 1},
+			Billing:              &account.Billing{AccountID: 1, MonthlyLimit: 100, SyncedAt: now},
+			ModelCapabilityKnown: true, SupportsModel: true,
+		},
+		{
+			Credential:           account.Credential{ID: 2, Priority: 1},
+			Billing:              &account.Billing{AccountID: 2, MonthlyLimit: 10, SyncedAt: now.Add(-time.Hour)},
+			ModelCapabilityKnown: true, SupportsModel: true,
+		},
+	}
+	plan, err := selector.planCandidates(context.Background(), values, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, ok := plan.Next()
+	if !ok || first.Credential.ID != 2 {
+		t.Fatalf("first candidate = %#v, want least recently selected account 2", first)
 	}
 }
 
